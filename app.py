@@ -12,9 +12,9 @@
                   • role-based (admin / user)
 
     SHELL         • TRUE PTY shell per session (interactive bash)
+                  • xterm.js frontend — full ANSI/color/cursor/tab support
                   • multiple concurrent sessions, window resize
                   • persistent working dir + history
-                  • one-shot command runner
 
     FILES         • browse / upload / download / edit / rename
                   • create file/folder, delete, copy, move, chmod
@@ -51,53 +51,20 @@
   DEPLOY ON RENDER.COM
   ═══════════════════════════════════════════════════════════════════════════════
 
-  Files you need in your repo:
-      app.py                    ← this file (rename to app.py)
-      requirements.txt          ← listed below
-      render.yaml               ← listed below (optional but recommended)
-
-  ── requirements.txt ──────────────────────────────────────────────────────
+  Requirements (requirements.txt):
       flask>=3.0.0
       psutil>=5.9.0
       gunicorn>=21.2.0
 
-  ── render.yaml ───────────────────────────────────────────────────────────
-      services:
-        - type: web
-          name: railvps-pro
-          runtime: python
-          plan: starter            # "free" works but has NO disk
-          buildCommand: pip install -r requirements.txt
-          startCommand: >
-            gunicorn -w 1 --threads 32 --timeout 0
-            -b 0.0.0.0:$PORT app:app
-          envVars:
-            - key: SECRET_KEY
-              generateValue: true
-            - key: VPS_USERNAME
-              value: admin
-            - key: VPS_PASSWORD
-              sync: false          # you set this in Render dashboard
-            - key: DATA_DIR
-              value: /var/data
-          disk:
-            name: vpsdata
-            mountPath: /var/data
-            sizeGB: 10
+  Start command:
+      gunicorn -w 1 --threads 32 --timeout 0 --keep-alive 75 -b 0.0.0.0:$PORT app:app
 
-  ── Render notes ──────────────────────────────────────────────────────────
-    • Free plan has NO persistent disk.  Your files vanish on every redeploy.
-      Set DATA_DIR to any writable path (default fallback works) — but be
-      aware the data is ephemeral.
-    • Starter plan or higher supports a real persistent Disk.  Mount it at
-      /var/data and it survives redeploys / restarts.
-    • Render injects $PORT — the startCommand above binds to it.
-    • PTY shell, subprocesses, sockets all work because Render runs a real
-      Linux container (unlike some serverless platforms).
-    • To enable long-lived WebSocket-style shell polling, keep the worker
-      count at 1 with many threads (as shown above).  Sessions are
-      in-process; if you scale to multiple instances, sessions won't be
-      shared across them.
+  Env vars:
+      SECRET_KEY       long random string
+      VPS_USERNAME     admin
+      VPS_PASSWORD     <strong password>
+      DATA_DIR         /var/data   (or /tmp/vpsdata on free tier)
+      PYTHON_VERSION   3.11.9
 
 ================================================================================
 """
@@ -134,23 +101,12 @@ SECRET_KEY  = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 MAX_UPLOAD  = int(os.environ.get("MAX_UPLOAD_MB", "1024")) * 1024 * 1024
 CMD_TIMEOUT = int(os.environ.get("CMD_TIMEOUT", "60"))
 
-# ---- Render environment detection -------------------------------------------
 IS_RENDER = (os.environ.get("RENDER") == "true"
              or "RENDER_SERVICE_NAME" in os.environ
              or "RENDER_EXTERNAL_URL" in os.environ)
 
 
 def _pick_data_dir() -> Path:
-    """
-    Pick a writable persistent directory.
-
-    Priority:
-      1. $DATA_DIR (you set this to your Render Disk mount, e.g. /var/data)
-      2. /var/data  (Render's conventional disk mount path)
-      3. /data      (Railway's conventional disk mount path)
-      4. ./vps_data (ephemeral fallback — data lost on redeploy on free plan)
-    """
-    # 1) explicit
     env = os.environ.get("DATA_DIR")
     if env:
         p = Path(env)
@@ -160,12 +116,10 @@ def _pick_data_dir() -> Path:
                 return p
         except Exception:
             pass
-    # 2/3) conventional mounts
     for cand in ("/var/data", "/data"):
         p = Path(cand)
         if p.is_dir() and os.access(str(p), os.W_OK):
             return p
-    # 4) fallback
     p = Path(__file__).resolve().parent / "vps_data"
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -182,9 +136,8 @@ LOGS_DIR   = DATA_DIR / "logs"
 for d in (FILES_DIR, BACKUP_DIR, LOGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Detect whether this looks like an ephemeral path (warn the user)
-EPHEMERAL_DATA = str(DATA_DIR).startswith(str(Path(__file__).resolve().parent)) \
-                 or str(DATA_DIR) in ("/tmp", "/var/tmp")
+EPHEMERAL_DATA = (str(DATA_DIR).startswith(str(Path(__file__).resolve().parent))
+                  or str(DATA_DIR) in ("/tmp", "/var/tmp"))
 
 USING_DEFAULT_PASSWORD = False
 
@@ -195,12 +148,8 @@ app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-# Render terminates TLS at the edge → cookies must not require Secure to be
-# set by us (Render forwards X-Forwarded-Proto).  Leave SESSION_COOKIE_SECURE
-# unset so it works on both http preview and https production.
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
 
-# Trust Render's proxy headers so url_for()/redirect() generate https URLs
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=0)
@@ -1735,6 +1684,9 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RailVPS Pro — Control Panel</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <style>
 :root{
   --bg:#080b10;--panel:#0f1520;--panel2:#0b1119;--border:#1c2531;
@@ -1835,10 +1787,6 @@ tr:hover .acts{opacity:1}
 #drop{border:2px dashed #22303f;border-radius:10px;padding:22px;text-align:center;
   color:var(--muted);font-size:12px;margin-bottom:13px;transition:.15s}
 #drop.over{border-color:var(--accent);background:#0d1724;color:var(--accent)}
-#term{background:#05080c;border:1px solid var(--border);border-radius:10px 10px 0 0;
-  height:calc(100vh - 230px);min-height:320px;overflow-y:auto;padding:13px 15px;
-  font-size:12.5px;line-height:1.55;white-space:pre;word-break:break-word;
-  font-family:ui-monospace,Menlo,Consolas,monospace}
 .termline{display:flex;gap:0;align-items:stretch;margin-top:0;background:#05080c;
   border:1px solid var(--border);border-top:0;border-radius:0 0 10px 10px;padding:6px 10px}
 .termline input{flex:1;background:transparent;border:0;padding:4px 6px;outline:none;
@@ -2008,13 +1956,16 @@ tr:hover .acts{opacity:1}
 
     <section class="view" id="v-term">
       <h2 class="title">Web Terminal</h2>
-      <p class="desc">Real PTY bash. Full interactive shell. Ctrl+K to focus.</p>
-      <div id="term"></div>
-      <div class="termline">
-        <input id="cmd" autocomplete="off" spellcheck="false"
-          placeholder="interactive shell (real PTY)">
-        <button class="btn sm" id="btn-kill-shell" title="Kill shell">✕</button>
+      <p class="desc">Real PTY bash. Full interactive shell. Click the terminal to focus.</p>
+      <div id="term-wrap" style="background:#05080c;border:1px solid var(--border);
+           border-radius:10px;padding:8px 4px 4px 8px;
+           height:calc(100vh - 230px);min-height:320px;overflow:hidden">
+        <div id="term" style="width:100%;height:100%"></div>
+      </div>
+      <div class="termline" style="margin-top:8px;border-radius:10px;border-top:1px solid var(--border);justify-content:flex-start;gap:9px">
+        <button class="btn sm" id="btn-kill-shell" title="Kill shell">✕ kill shell</button>
         <button class="btn sm" id="btn-clear">clear</button>
+        <span class="muted" id="term-status" style="margin-left:auto;font-size:11px"></span>
       </div>
     </section>
 
@@ -2318,7 +2269,7 @@ $$('.nav').forEach(n=>n.addEventListener('click',()=>{
   if(currentView==='sys')loadSysFull();
   if(currentView==='pip')loadPip();
   if(currentView==='net'){loadPorts();loadIfaces();}
-  if(currentView==='term')setTimeout(()=>$('#cmd').focus(),60);
+  if(currentView==='term')setTimeout(()=>{ensureTerm();if(xterm){try{fitAddon.fit();}catch(e){}xterm.focus();}},60);
 }));
 
 async function loadStats(){
@@ -2550,50 +2501,132 @@ async function doSave(){
   if(r.ok)$('#ed-status').textContent='saved just now';
 }
 
-let termEl,cmdEl,shellReady=false;
-function ensureTerm(){termEl=termEl||$('#term');cmdEl=cmdEl||$('#cmd');}
-async function initShell(){
-  ensureTerm();
-  try{const r=await postJSON('/api/shell/spawn',{});
-    if(!r.ok){toast('Shell spawn failed','err');return;}
-    shellReady=true;readLoop();cmdEl.focus();
-  }catch(e){toast('Shell init error','err');}
+/* ============================================================================
+   Terminal (xterm.js + real PTY)
+   ========================================================================= */
+let xterm = null;
+let fitAddon = null;
+let shellReady = false;
+let readAbort = null;
+
+function ensureTerm() {
+  if (xterm) return;
+  const el = document.getElementById('term');
+  if (!el) return;
+  if (typeof Terminal === 'undefined') {
+    el.innerHTML = '<div style="padding:20px;color:#ff5c5c">xterm.js failed to load (CDN blocked?). Terminal unavailable.</div>';
+    return;
+  }
+
+  xterm = new Terminal({
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 13,
+    lineHeight: 1.2,
+    theme: {
+      background: '#05080c',
+      foreground: '#d7e0ea',
+      cursor: '#3ea6ff',
+      selectionBackground: '#1f3a55',
+      black:   '#1c2531', red:     '#ff5c5c',
+      green:   '#2ecc71', yellow:  '#f5a623',
+      blue:    '#3ea6ff', magenta: '#a67cff',
+      cyan:    '#56d4dd', white:   '#d7e0ea',
+      brightBlack:   '#4a5768', brightRed:     '#ff8080',
+      brightGreen:   '#5ce49b', brightYellow:  '#ffc754',
+      brightBlue:    '#7bc3ff', brightMagenta: '#c4a6ff',
+      brightCyan:    '#7de5ec', brightWhite:   '#ffffff',
+    },
+    scrollback: 5000,
+    allowProposedApi: true,
+  });
+
+  fitAddon = new FitAddon.FitAddon();
+  xterm.loadAddon(fitAddon);
+  xterm.open(el);
+
+  xterm.onData(data => {
+    if (!shellReady) return;
+    postJSON('/api/shell/write', { data });
+  });
+
+  xterm.onResize(({ rows, cols }) => {
+    if (!shellReady) return;
+    postJSON('/api/shell/resize', { rows, cols });
+  });
+
+  setTimeout(() => {
+    try { fitAddon.fit(); } catch (e) {}
+    xterm.focus();
+  }, 60);
 }
-async function readLoop(){
-  while(shellReady){
-    try{const r=await api('/api/shell/read');const buf=await r.arrayBuffer();
-      if(buf.byteLength){const text=new TextDecoder('utf-8',{fatal:false}).decode(buf);
-        termEl.textContent+=text;termEl.scrollTop=termEl.scrollHeight;}
-    }catch(e){break;}
+
+async function initShell() {
+  ensureTerm();
+  if (!xterm) return;
+  try {
+    const r = await postJSON('/api/shell/spawn', {});
+    if (!r.ok) { toast('Shell spawn failed', 'err'); return; }
+    shellReady = true;
+    setTermStatus('shell: ' + r.sid.slice(0, 8) + '  ·  connected');
+    readLoop();
+    xterm.focus();
+  } catch (e) {
+    toast('Shell init error', 'err');
   }
 }
-function termSend(data){if(!shellReady)return;postJSON('/api/shell/write',{data});}
 
-document.addEventListener('keydown',e=>{
-  if(currentView!=='term')return;if(!cmdEl)return;
-  const k=e.key;
-  if(k==='Enter'){e.preventDefault();termSend('\n');cmdEl.value='';}
-  else if(k==='Backspace'){e.preventDefault();termSend('\x7f');
-    if(cmdEl.value)cmdEl.value=cmdEl.value.slice(0,-1);}
-  else if(k==='Tab'){e.preventDefault();termSend('\t');}
-  else if(k==='ArrowUp'){e.preventDefault();termSend('\x1b[A');}
-  else if(k==='ArrowDown'){e.preventDefault();termSend('\x1b[B');}
-  else if(k==='ArrowLeft'){e.preventDefault();termSend('\x1b[D');}
-  else if(k==='ArrowRight'){e.preventDefault();termSend('\x1b[C');}
-  else if(k==='Home'){e.preventDefault();termSend('\x1b[H');}
-  else if(k==='End'){e.preventDefault();termSend('\x1b[F');}
-  else if(k==='Escape'){e.preventDefault();termSend('\x1b');}
-  else if(k==='Delete'){e.preventDefault();termSend('\x1b[3~');}
-  else if(e.ctrlKey&&k.length===1){e.preventDefault();
-    const c=k.toLowerCase().charCodeAt(0)-96;
-    if(c>=1&&c<=26)termSend(String.fromCharCode(c));}
-  else if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&k.length===1){
-    e.preventDefault();termSend(k);cmdEl.value+=k;}
+async function readLoop() {
+  if (readAbort) { try { readAbort.abort(); } catch (e) {} }
+  readAbort = new AbortController();
+
+  while (shellReady) {
+    try {
+      const r = await fetch('/api/shell/read', {
+        credentials: 'same-origin',
+        signal: readAbort.signal,
+      });
+      if (r.status === 401) { location.href = '/login'; return; }
+      const buf = await r.arrayBuffer();
+      if (buf.byteLength && xterm) {
+        xterm.write(new Uint8Array(buf));
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      await new Promise(res => setTimeout(res, 400));
+    }
+  }
+}
+
+function setTermStatus(t) {
+  const el = document.getElementById('term-status');
+  if (el) el.textContent = t;
+}
+
+document.getElementById('btn-clear').onclick = () => {
+  if (xterm) { xterm.clear(); xterm.write('\x1b[2J\x1b[H'); }
+};
+
+document.getElementById('btn-kill-shell').onclick = async () => {
+  await postJSON('/api/shell/kill', {});
+  shellReady = false;
+  if (readAbort) try { readAbort.abort(); } catch (e) {}
+  setTermStatus('shell killed');
+  if (xterm) { xterm.clear(); xterm.write('\x1b[2J\x1b[H'); }
+  toast('Shell killed', 'ok');
+  setTimeout(initShell, 300);
+};
+
+window.addEventListener('resize', () => {
+  if (fitAddon && xterm) {
+    try { fitAddon.fit(); } catch (e) {}
+  }
 });
-$('#btn-clear').onclick=()=>{if(termEl)termEl.textContent='';};
-$('#btn-kill-shell').onclick=async()=>{
-  await postJSON('/api/shell/kill',{});shellReady=false;toast('Shell killed','ok');
-  setTimeout(initShell,250);};
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && fitAddon && xterm) {
+    try { fitAddon.fit(); } catch (e) {}
+  }
+});
 
 async function loadProcs(){
   try{const d=await apiJSON('/api/processes');
@@ -2921,10 +2954,9 @@ document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==='k'){e.preventDefault();
     document.querySelector('.nav[data-view="term"]').click();}});
 window.addEventListener('resize',()=>{
-  if(shellReady&&termEl){
-    const cols=Math.floor(termEl.clientWidth/8);
-    const rows=Math.floor(termEl.clientHeight/18);
-    postJSON('/api/shell/resize',{rows,cols});}});
+  if(shellReady&&xterm&&fitAddon){
+    try{fitAddon.fit();}catch(e){}}
+});
 </script>
 </body>
 </html>"""
@@ -2964,7 +2996,5 @@ _banner()
 
 
 if __name__ == "__main__":
-    # On Render, gunicorn is used in production — this block is only for local
-    # testing.  Render injects $PORT.
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
